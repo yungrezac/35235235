@@ -1,15 +1,15 @@
 import os
 import logging
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    BotCommand
 )
 from telegram.ext import (
     Application,
@@ -18,7 +18,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
     ContextTypes,
-    JobQueue
+    InlineQueryHandler,
+    ChatMemberHandler
 )
 
 load_dotenv()
@@ -28,10 +29,8 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 # Конфигурация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+STARTING_BALANCE = 1000  # Демо баланс
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
-MIN_BET = 50
-MAX_BET = 5000
-REFERRAL_BONUS = 100
 
 # Настройка логов
 logging.basicConfig(
@@ -40,229 +39,201 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class GameManager:
-    @staticmethod
-    async def generate_cards():
-        return [random.randint(1, 36) for _ in range(3)]
-
-    @staticmethod
-    async def determine_winner(cards):
-        unique = len(set(cards))
-        if unique == 1:
-            return 'трипл'
-        elif unique == 2:
-            return 'пара'
-        else:
-            return 'старшая карта'
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ref_code = context.args[0] if context.args else None
     
     user_data = supabase.table('users').select('*').eq('user_id', user.id).execute().data
     if not user_data:
-        # Реферальная логика
-        if ref_code:
-            referrer = supabase.table('users').select('*').eq('user_id', ref_code).execute().data
-            if referrer:
-                supabase.table('referrals').insert({
-                    'referrer_id': ref_code,
-                    'referred_id': user.id
-                }).execute()
-                supabase.rpc('increment_referrals', {'user_id': ref_code}).execute()
-                supabase.rpc('update_balance', {'user_id': user.id, 'amount': REFERRAL_BONUS}).execute()
-        
+        # Создание пользователя с демо балансом
         supabase.table('users').insert({
             'user_id': user.id,
             'username': user.username,
-            'balance': REFERRAL_BONUS if ref_code else 0
+            'balance': STARTING_BALANCE
         }).execute()
+        
+        # Реферальная система
+        if ref_code and ref_code != str(user.id):
+            supabase.table('referrals').insert({
+                'referrer_id': ref_code,
+                'referred_id': user.id
+            }).execute()
+            supabase.rpc('increment_balance', {'user_id': ref_code, 'amount': 200}).execute()
+            supabase.rpc('increment_balance', {'user_id': user.id, 'amount': 100}).execute()
     
+    # Главное меню
     keyboard = [
-        [KeyboardButton("💰 Баланс"), KeyboardButton("🎮 Начать игру")],
-        [KeyboardButton("📥 Пополнить"), KeyboardButton("📊 Статистика")]
+        [InlineKeyboardButton("🎮 Начать игру", callback_data="main_game")],
+        [InlineKeyboardButton("💼 Профиль", callback_data="profile"),
+         InlineKeyboardButton("💵 Пополнить", callback_data="deposit")],
+        [InlineKeyboardButton("➕ Добавить в чат", callback_data="add_to_chat"),
+         InlineKeyboardButton("🌐 Чаты с ботом", callback_data="active_chats")]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
-    await update.message.reply_text(
-        f"👋 Добро пожаловать, {user.first_name}!\n\n"
-        "🚀 Используйте кнопки ниже для управления:",
-        reply_markup=reply_markup
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.message:
+        await update.message.reply_text(
+            "🏆 Добро пожаловать в Casino Bot!\nВыберите действие:",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            "🏆 Добро пожаловать в Casino Bot!\nВыберите действие:",
+            reply_markup=reply_markup
+        )
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    data = supabase.table('users').select('balance').eq('user_id', user.id).execute().data[0]
-    await update.message.reply_text(f"💵 Ваш баланс: {data['balance']}₽")
-
-async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🥝 QIWI", callback_data="deposit_qiwi"),
-         InlineKeyboardButton("💳 Card", callback_data="deposit_card")]
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите способ пополнения:", reply_markup=markup)
-
-async def handle_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Генерация платежных данных
-    payment_data = ... # Интеграция с платежной системой
+    data = query.data
+    user = query.from_user
     
-    await query.edit_message_text(
-        f"💳 Для пополнения:\n\n"
-        f"Сумма: {payment_data['amount']}₽\n"
-        f"Кошелек: {payment_data['wallet']}\n\n"
-        "⚠️ Отправьте точную сумму в течение 15 минут"
-    )
+    if data == "main_game":
+        # Кнопки выбора типа игры
+        keyboard = [
+            [InlineKeyboardButton("🎰 Быстрая игра", callback_data="quick_game")],
+            [InlineKeyboardButton("👥 Мультиплеер", callback_data="multiplayer")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            "🎮 Выберите тип игры:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "profile":
+        user_data = supabase.table('users').select('*').eq('user_id', user.id).execute().data[0]
+        ref_link = f"https://t.me/{context.bot.username}?start={user.id}"
+        
+        text = (
+            f"👤 Ваш профиль:\n\n"
+            f"💵 Баланс: {user_data['balance']}₽\n"
+            f"📈 Игр сыграно: {user_data.get('games_played', 0)}\n"
+            f"🎉 Побед: {user_data.get('wins', 0)}\n\n"
+            f"🔗 Реф. ссылка: {ref_link}"
+        )
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "deposit":
+        keyboard = [
+            [InlineKeyboardButton("🥝 QIWI", callback_data="deposit_qiwi"),
+             InlineKeyboardButton("💳 Карта", callback_data="deposit_card")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            "💰 Выберите способ пополнения:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "add_to_chat":
+        bot_username = context.bot.username
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]]
+        await query.edit_message_text(
+            f"👥 Чтобы добавить бота в чат:\n\n"
+            f"1. Откройте нужный чат\n"
+            f"2. Добавьте @{bot_username}\n"
+            f"3. Выдайте права администратора\n\n"
+            "После этого бот будет доступен в списке чатов!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "active_chats":
+        chats = supabase.table('chats').select('chat_id,title').execute().data
+        if not chats:
+            await query.answer("😢 Пока нет активных чатов")
+            return
+        
+        keyboard = []
+        for chat in chats:
+            keyboard.append([InlineKeyboardButton(
+                f"💬 {chat['title']}", 
+                callback_data=f"joinchat_{chat['chat_id']}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+        
+        await query.edit_message_text(
+            "🌐 Доступные чаты для игры:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data.startswith("joinchat_"):
+        chat_id = data.split("_")[1]
+        await query.answer("ℹ️ Используйте команду /start в выбранном чате!")
+    
+    elif data == "main_menu":
+        await start(update, context)
 
-async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик добавления/удаления бота из чатов"""
+    if update.my_chat_member:
+        chat = update.my_chat_member.chat
+        new_status = update.my_chat_member.new_chat_member.status
+        
+        if new_status == 'administrator':
+            supabase.table('chats').upsert({
+                'chat_id': chat.id,
+                'title': chat.title,
+                'type': chat.type,
+                'added_at': datetime.now().isoformat()
+            }).execute()
+        elif new_status in ['kicked', 'left']:
+            supabase.table('chats').delete().eq('chat_id', chat.id).execute()
+
+async def handle_game_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды начала игры в чатах"""
+    if update.message.chat.type == 'private':
+        return
+    
     try:
-        bet = float(update.message.text.split()[-1])
-        if not (MIN_BET <= bet <= MAX_BET):
-            raise ValueError
-        
+        bet = float(context.args[0])
         user = update.effective_user
-        user_data = supabase.table('users').select('balance').eq('user_id', user.id).execute().data[0]
         
-        if user_data['balance'] < bet:
+        user_data = supabase.table('users').select('balance').eq('user_id', user.id).execute().data
+        if not user_data or user_data[0]['balance'] < bet:
             await update.message.reply_text("❌ Недостаточно средств!")
             return
         
         # Создание игры
         game = supabase.table('games').insert({
-            'chat_id': update.effective_chat.id,
+            'chat_id': update.message.chat.id,
             'creator_id': user.id,
             'bet_amount': bet,
             'status': 'waiting'
         }).execute().data[0]
         
-        # Кнопка присоединения
+        # Сообщение с кнопкой присоединения
         keyboard = [[InlineKeyboardButton("✅ Присоединиться", callback_data=f"join_{game['id']}")]]
-        markup = InlineKeyboardMarkup(keyboard)
-        
-        msg = await update.message.reply_text(
-            f"🎮 Игра #{game['id']}\n"
-            f"💵 Ставка: {bet}₽\n"
-            f"⏳ Осталось времени: 60 сек",
-            reply_markup=markup
+        await update.message.reply_text(
+            f"🎮 Новая игра!\nСтавка: {bet}₽\nУчастники: 1",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        
-        # Запуск таймера
-        context.job_queue.run_once(end_game, 60, data={
-            'chat_id': update.effective_chat.id,
-            'message_id': msg.message_id,
-            'game_id': game['id']
-        })
-        
+    
     except:
-        await update.message.reply_text(f"❌ Некорректная ставка! Диапазон: {MIN_BET}-{MAX_BET}₽")
-
-async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    game_id = int(query.data.split('_')[1])
-    
-    user = query.from_user
-    game = supabase.table('games').select('*').eq('id', game_id).execute().data[0]
-    
-    # Проверки
-    if supabase.table('game_players').select('*').eq('game_id', game_id).eq('user_id', user.id).execute().data:
-        await query.answer("Вы уже в игре!")
-        return
-    
-    if supabase.table('users').select('balance').eq('user_id', user.id).execute().data[0]['balance'] < game['bet_amount']:
-        await query.answer("Недостаточно средств!")
-        return
-    
-    # Добавление игрока
-    supabase.table('game_players').insert({
-        'game_id': game_id,
-        'user_id': user.id
-    }).execute()
-    
-    await query.answer("Вы успешно присоединились!")
-    await query.edit_message_text(
-        query.message.text + f"\n👤 Участник: {user.first_name}"
-    )
-
-async def end_game(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    game = supabase.table('games').select('*').eq('id', job.data['game_id']).execute().data[0]
-    
-    if game['status'] != 'waiting':
-        return
-    
-    players = supabase.table('game_players').select('user_id').eq('game_id', job.data['game_id']).execute().data
-    
-    if len(players) < 2:
-        await context.bot.edit_message_text(
-            "❌ Игра отменена: недостаточно участников",
-            chat_id=job.data['chat_id'],
-            message_id=job.data['message_id']
-        )
-        return
-    
-    # Генерация карт и определение победителя
-    results = []
-    for player in players:
-        cards = await GameManager.generate_cards()
-        result = await GameManager.determine_winner(cards)
-        supabase.table('game_players').update({
-            'cards': str(cards),
-            'result': result
-        }).eq('game_id', job.data['game_id']).eq('user_id', player['user_id']).execute()
-        results.append((player['user_id'], result, max(cards)))
-    
-    # Определение победителя
-    winner = sorted(results, key=lambda x: (x[1], x[2]), reverse=True)[0]
-    total_pot = game['bet_amount'] * len(players)
-    
-    # Обновление балансов
-    supabase.rpc('update_balance', {'user_id': winner[0], 'amount': total_pot}).execute()
-    supabase.table('games').update({'status': 'finished'}).eq('id', job.data['game_id']).execute()
-    
-    # Отправка результатов
-    result_text = "🏆 Результаты игры:\n\n"
-    for user_id, res, card in results:
-        user = await context.bot.get_chat(user_id)
-        result_text += f"{user.first_name}: {res} ({card})\n"
-    
-    result_text += f"\n🎉 Победитель: {await context.bot.get_chat(winner[0]).first_name} +{total_pot}₽"
-    
-    await context.bot.edit_message_text(
-        result_text,
-        chat_id=job.data['chat_id'],
-        message_id=job.data['message_id']
-    )
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    data = supabase.table('users').select('*').eq('user_id', user.id).execute().data[0]
-    
-    stats_text = (
-        f"📊 Ваша статистика:\n\n"
-        f"🎮 Игр сыграно: {data['games_played']}\n"
-        f"🏆 Побед: {data['wins']}\n"
-        f"💸 Общий выигрыш: {data['total_won']}₽\n"
-        f"👥 Рефералы: {data['referrals_count']}"
-    )
-    
-    await update.message.reply_text(stats_text)
+        await update.message.reply_text("Использование: /game <ставка>")
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
-    # Регистрация обработчиков
+    # Обработчики
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex(r"^💰 Баланс$"), balance))
-    app.add_handler(MessageHandler(filters.Regex(r"^🎮 Начать игру"), start_game))
-    app.add_handler(MessageHandler(filters.Regex(r"^📥 Пополнить"), deposit))
-    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статистика"), stats))
-    app.add_handler(CallbackQueryHandler(handle_deposit, pattern="^deposit_"))
-    app.add_handler(CallbackQueryHandler(join_game, pattern="^join_"))
+    app.add_handler(CommandHandler("game", handle_game_creation))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(ChatMemberHandler(track_chats))
+    
+    # Фильтры
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     
     app.run_polling()
+
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Запустить бота"),
+        BotCommand("game", "Начать новую игру (в чате)"),
+        BotCommand("profile", "Ваш профиль")
+    ])
 
 if __name__ == "__main__":
     main()
