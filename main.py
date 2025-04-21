@@ -733,7 +733,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     # Замените 'YOUR_BOT_TOKEN' на реальный токен вашего бота
-    application = Application.builder().token("YOUR_BOT_TOKEN").build()
+    application = Application.builder().token("6939360001:AAFI3w7MzpR-10314IstaCQwChx5ByFvMhk").build()
     
     # Обработчики команд
     command_handlers = {
